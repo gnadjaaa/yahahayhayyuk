@@ -212,6 +212,7 @@ def exploit():
 
 # Autosolver
 def autosolver():
+    print("dalam masa pengembangan fitur autosolver reverse engineering, tunggu update selanjutnya.")
     def objdump(binary):
         out = subprocess.run(
             ["objdump", "-d", binary, "-M", "intel"],
